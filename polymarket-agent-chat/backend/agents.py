@@ -1,41 +1,35 @@
 """Agent: interpret user prompt and run Polymarket data/trade actions + Liquid perps."""
 import os
 import json
+import logging
 from polymarket import fetch_events, flatten_markets, filter_by_query
 from liquid import get_liquid_markets, get_ticker
 
+logger = logging.getLogger("agents")
+
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 
-# Theme keywords -> Liquid perp symbols (README: CL-PERP oil, GC-PERP gold, etc.)
-THEME_SYMBOLS = {
-    "oil": ["CL-PERP", "GC-PERP"],
-    "crypto": ["BTC-PERP", "ETH-PERP", "SOL-PERP"],
-    "gold": ["GC-PERP"],
-    "silver": ["SI-PERP"],
-    "iran": ["CL-PERP", "GC-PERP"],
-    "btc": ["BTC-PERP"],
-    "eth": ["ETH-PERP"],
-}
-
-# Expand query to related terms so we get more Polymarket markets (e.g. "iran" -> geopolit, fifa, oil)
-QUERY_EXPANSION = {
-    "iran": ["iran", "geopolit", "fifa", "world cup", "oil", "israel", "middle east", "escalat"],
-    "oil": ["oil", "crude", "opec", "wti", "cl ", "energy", "gas"],
-    "trump": ["trump", "elect", "republican", "president"],
-    "crypto": ["crypto", "bitcoin", "btc", "eth", "ethereum", "sol"],
-}
 
 
-def _liquid_symbols_for_query(query: str):
-    """Return list of Liquid perp symbols matching theme (from THEME_SYMBOLS)."""
+def _liquid_symbols_for_query(query: str, available_symbols: list[str]) -> list[str]:
+    """Pure fuzzy search: match query words against available Liquid symbol/ticker names. No hardcoded maps."""
     q = (query or "").strip().lower()
-    out = set()
-    for kw, syms in THEME_SYMBOLS.items():
-        if kw in q:
-            out.update(syms)
-    if out:
-        return list(out)
-    return ["BTC-PERP", "ETH-PERP", "CL-PERP", "GC-PERP"]
+    search_words = [w for w in q.split() if len(w) >= 2]
+    if not search_words:
+        return [s for s in available_symbols if "BTC" in s.upper()][:3]
+    out = []
+    for sym in available_symbols:
+        sym_lower = sym.lower()
+        # Extract the ticker part (after : or before -PERP)
+        ticker = sym_lower.split(":")[-1].replace("-perp", "")
+        if len(ticker) < 2:
+            continue
+        for word in search_words:
+            if word == ticker or (len(word) >= 3 and word in ticker) or (len(ticker) >= 3 and ticker in word):
+                out.append(sym)
+                break
+    logger.info(f"_liquid_symbols_for_query({q!r}) words={search_words} -> matched {len(out)}: {out}")
+    return out if out else [s for s in available_symbols if "BTC" in s.upper()][:3]
 
 
 def _short_query_from_prompt(prompt: str) -> str:
@@ -55,19 +49,21 @@ async def _claude_parse_request(prompt: str, available_liquid_symbols: list[str]
     try:
         import anthropic
         client = anthropic.AsyncAnthropic()
-        symbols_preview = (available_liquid_symbols or [])[:50]
+        symbols_preview = available_liquid_symbols or []
         msg = await client.messages.create(
-            model="claude-sonnet-4-20250514",
+            model="claude-haiku-4-5-20251001",
             max_tokens=400,
             messages=[{
                 "role": "user",
                 "content": (
                     f"User said: \"{prompt}\"\n\n"
-                    "Available Liquid perp symbols (examples): " + ", ".join(symbols_preview) + "\n\n"
+                    "Available Liquid symbols (crypto perps like BTC-PERP, commodities like xyz:CL or flx:OIL, "
+                    "stocks like xyz:NVDA, indices like abcd:USA500): " + ", ".join(symbols_preview) + "\n\n"
                     "Reply with ONLY valid JSON, no markdown or explanation. Keys: "
                     '"intent" (one of: markets, trade, general), '
                     '"search_terms" (array of 2-8 words/phrases to find related Polymarket prediction markets, e.g. iran, geopolit, oil, election), '
-                    '"liquid_symbols" (array of 0-15 symbols from the available list that fit the user request; if empty we show defaults).'
+                    '"liquid_symbols" (array of 0-15 symbols from the EXACT available list above that fit the user request; '
+                    'include ALL relevant symbols across different providers like xyz:, flx:, km:, cash:, hyna: prefixes; if empty we show defaults).'
                 )
             }]
         )
@@ -147,7 +143,7 @@ async def _claude_select_batch(prompt: str, markets: list[dict], liquid: list[di
             ),
         }
         msg = await client.messages.create(
-            model="claude-sonnet-4-20250514",
+            model="claude-haiku-4-5-20251001",
             max_tokens=600,
             messages=[
                 {"role": "system", "content": system_msg},
@@ -203,12 +199,7 @@ async def run_agent(prompt: str) -> dict:
             extra = search_terms[1:] if len(search_terms) > 1 else None
         else:
             query = _short_query_from_prompt(prompt)
-            extra = []
-            for key, terms in QUERY_EXPANSION.items():
-                if key in (query or "").lower():
-                    extra = terms[1:]
-                    break
-            extra = extra if extra else None
+            extra = None
 
         events = await fetch_events(limit=200)
         all_markets = flatten_markets(events)
@@ -230,24 +221,29 @@ async def run_agent(prompt: str) -> dict:
         else:
             markets = markets[:60]
 
-        syms = claude_liquid if claude_liquid else _liquid_symbols_for_query(query or " ".join(search_terms))
+        # Claude may pick symbols, otherwise search dynamically against real available symbols
+        if claude_liquid:
+            syms = [s for s in claude_liquid if s in available_symbols]
+            logger.info(f"Claude picked liquid symbols: {claude_liquid} -> valid: {syms}")
+        else:
+            syms = _liquid_symbols_for_query(query or " ".join(search_terms), available_symbols)
+        logger.info(f"Final Liquid symbols to fetch tickers for: {syms}")
         liquid_list: list[dict] = []
-        try:
-            for m in (all_liq_raw or []):
-                s = (m.get("symbol") if isinstance(m, dict) else getattr(m, "symbol", None)) or ""
-                if s in syms:
+        for m in (all_liq_raw or []):
+            s = (m.get("symbol") if isinstance(m, dict) else getattr(m, "symbol", None)) or ""
+            if s in syms:
+                try:
                     tick = await get_ticker(s)
-                    liquid_list.append({
-                        "symbol": s,
-                        "max_leverage": m.get("max_leverage") if isinstance(m, dict) else getattr(m, "max_leverage", None),
-                        "mark_price": tick.get("mark_price") if tick else None,
-                        "volume_24h": tick.get("volume_24h") if tick else None,
-                    })
-        except Exception:
-            pass
-        if not liquid_list and syms:
-            for s in syms:
-                liquid_list.append({"symbol": s, "max_leverage": None, "mark_price": None, "volume_24h": None})
+                    logger.info(f"Ticker for {s}: {tick}")
+                    if tick and tick.get("mark_price") is not None:
+                        liquid_list.append({
+                            "symbol": s,
+                            "max_leverage": m.get("max_leverage") if isinstance(m, dict) else getattr(m, "max_leverage", None),
+                            "mark_price": tick.get("mark_price"),
+                            "volume_24h": tick.get("volume_24h"),
+                        })
+                except Exception as e:
+                    logger.error(f"Error fetching ticker for {s}: {e}")
 
         # Optionally use Claude to reorder or highlight; keep ALL theme-matched markets on both platforms
         pm_ids, liq_syms = await _claude_select_batch(prompt, markets, liquid_list)

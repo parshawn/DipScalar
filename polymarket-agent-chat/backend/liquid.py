@@ -1,6 +1,10 @@
 """Liquid API client — market data + order execution. Requires LIQUID_API_KEY and LIQUID_API_SECRET."""
 import os
 import asyncio
+import logging
+
+logger = logging.getLogger("liquid")
+logging.basicConfig(level=logging.DEBUG, format="%(asctime)s [%(name)s] %(levelname)s: %(message)s")
 
 LIQUID_API_KEY = os.environ.get("LIQUID_API_KEY")
 LIQUID_API_SECRET = os.environ.get("LIQUID_API_SECRET")
@@ -20,7 +24,34 @@ async def get_liquid_markets():
         return []
     def _get():
         markets = c.get_markets()
-        return [{"symbol": m.get("symbol", ""), "max_leverage": m.get("max_leverage")} for m in markets] if isinstance(markets, list) else []
+        logger.debug(f"get_liquid_markets() raw type: {type(markets)}")
+        if markets and isinstance(markets, list):
+            # Log first 5 items fully to understand the structure
+            for i, m in enumerate(markets[:5]):
+                if isinstance(m, dict):
+                    logger.debug(f"  market[{i}] (dict): {m}")
+                else:
+                    logger.debug(f"  market[{i}] (obj type={type(m).__name__}): {vars(m) if hasattr(m, '__dict__') else dir(m)}")
+            logger.info(f"Total markets returned: {len(markets)}")
+        else:
+            logger.warning(f"get_liquid_markets() returned non-list or empty: {markets}")
+            return []
+        out = []
+        for m in markets:
+            # SDK may return dicts or objects — handle both
+            if isinstance(m, dict):
+                sym = m.get("symbol", "")
+                lev = m.get("max_leverage")
+                # Log all keys so we can see the full structure
+            else:
+                sym = getattr(m, "symbol", "")
+                lev = getattr(m, "max_leverage", None)
+            if sym:
+                out.append({"symbol": sym, "max_leverage": lev})
+        # Log all symbol names
+        all_syms = [x["symbol"] for x in out]
+        logger.info(f"All {len(all_syms)} Liquid symbols: {all_syms}")
+        return out
     return await asyncio.to_thread(_get)
 
 
@@ -30,11 +61,24 @@ async def get_ticker(symbol: str):
     if not c:
         return None
     def _get():
+        logger.debug(f"get_ticker({symbol}) calling API...")
         t = c.get_ticker(symbol)
+        logger.debug(f"get_ticker({symbol}) raw result type={type(t)}: {vars(t) if hasattr(t, '__dict__') else t}")
         if t is None:
+            logger.warning(f"get_ticker({symbol}) returned None")
             return None
-        return {"mark_price": getattr(t, "mark_price", None), "volume_24h": getattr(t, "volume_24h", None), "funding_rate": getattr(t, "funding_rate", None)}
-    return await asyncio.to_thread(_get, symbol)
+        # SDK returns string values for prices/volumes; cast to float for frontend
+        def _float(v):
+            try:
+                return float(v) if v is not None else None
+            except (ValueError, TypeError):
+                return None
+        return {
+            "mark_price": _float(getattr(t, "mark_price", None)),
+            "volume_24h": _float(getattr(t, "volume_24h", None)),
+            "funding_rate": _float(getattr(t, "funding_rate", None)),
+        }
+    return await asyncio.to_thread(_get)
 
 
 async def place_order(symbol: str, side: str, size: float, leverage: int = 1, order_type: str = "market"):
