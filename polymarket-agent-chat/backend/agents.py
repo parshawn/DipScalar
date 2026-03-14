@@ -12,7 +12,7 @@ ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 
 
 def _liquid_symbols_for_query(query: str, available_symbols: list[str]) -> list[str]:
-    """Pure fuzzy search: match query words against available Liquid symbol/ticker names. No hardcoded maps."""
+    """Match query words against available Liquid symbol/ticker names. Strict matching to avoid false positives."""
     q = (query or "").strip().lower()
     search_words = [w for w in q.split() if len(w) >= 2]
     if not search_words:
@@ -25,9 +25,15 @@ def _liquid_symbols_for_query(query: str, available_symbols: list[str]) -> list[
         if len(ticker) < 2:
             continue
         for word in search_words:
-            if word == ticker or (len(word) >= 3 and word in ticker) or (len(ticker) >= 3 and ticker in word):
+            # Exact match always works
+            if word == ticker:
                 out.append(sym)
                 break
+            # Only allow substring matching if BOTH are 4+ chars (avoids "nfl" in "nflx", "sol" in "resolv")
+            if len(word) >= 4 and len(ticker) >= 4:
+                if word in ticker or ticker in word:
+                    out.append(sym)
+                    break
     logger.info(f"_liquid_symbols_for_query({q!r}) words={search_words} -> matched {len(out)}: {out}")
     return out
 
@@ -61,15 +67,18 @@ async def _claude_parse_request(prompt: str, available_liquid_symbols: list[str]
                     "stocks like xyz:NVDA, indices like abcd:USA500): " + ", ".join(symbols_preview) + "\n\n"
                     "Reply with ONLY valid JSON, no markdown or explanation. Keys: "
                     '"intent" (one of: markets, trade, general), '
-                    '"search_terms" (array of 5-15 individual keywords/phrases to find related Polymarket prediction markets. '
-                    'Be EXHAUSTIVE — include the main term AND all synonyms, related concepts, sub-topics, and key entities. '
-                    'For example: "economy" -> ["fed", "rate", "recession", "inflation", "gdp", "tariff", "treasury", "unemployment", "economic", "jobs", "cpi"]. '
-                    '"sports" -> ["nba", "nfl", "mlb", "nhl", "soccer", "football", "basketball", "baseball", "champion", "finals", "premier league", "world cup"]. '
-                    'Think about what words would appear in prediction market QUESTIONS about this topic), '
+                    '"search_terms" (array of 5-15 keywords/phrases to find related Polymarket prediction markets. '
+                    'Include the main term AND related synonyms, sub-topics, and key entities. '
+                    'Use MULTI-WORD phrases when a single word would be too generic. '
+                    'For example: "economy" -> ["economy", "economic", "fed rate", "interest rate", "recession", "inflation", "gdp", "tariff", "unemployment"]. '
+                    '"football" -> ["nfl", "football", "nfl draft", "super bowl", "quarterback"]. '
+                    '"oil" -> ["crude oil", "oil price", "opec", "wti", "brent"]. '
+                    'Use "fed rate" not "rate" alone, "oil price" not "price" alone, "nfl season" not "season" alone), '
                     '"liquid_symbols" (array of 0-15 symbols from the EXACT available list above that DIRECTLY relate to the user request; '
                     'include ALL relevant symbols across different providers like xyz:, flx:, km:, cash:, hyna: prefixes. '
-                    'IMPORTANT: only include symbols that are genuinely related to the query. If nothing matches, return an empty array. '
-                    'Do NOT include random or loosely related symbols just to fill the list).'
+                    'IMPORTANT: only include symbols that are DIRECTLY related to the query. If nothing matches, return an empty array. '
+                    'Do NOT include random tokens. For example, "football" should NOT return NFLX (Netflix), SUPER-PERP (a crypto token), etc. '
+                    'Only return symbols for actual tradeable assets related to the topic).'
                 )
             }]
         )
@@ -187,6 +196,8 @@ async def run_agent(prompt: str) -> dict:
     search_terms = parsed.get("search_terms") or []
     claude_liquid = [s for s in (parsed.get("liquid_symbols") or []) if s]
 
+    logger.info(f"Claude parsed: intent={intent}, search_terms={search_terms}, liquid_symbols={claude_liquid}")
+
     wants_data = intent in ("markets", "trade") or any(
         x in prompt_lower
         for x in (
@@ -208,18 +219,52 @@ async def run_agent(prompt: str) -> dict:
         all_markets = flatten_markets(events)
         # Search with all terms at once (OR logic)
         markets = filter_by_query(all_markets, all_terms[0] if all_terms else "", extra_terms=all_terms[1:] if len(all_terms) > 1 else None)
-        # Sort by volume so best markets come first
-        markets = sorted(markets, key=lambda m: float(m.get("volume") or 0), reverse=True)[:60]
+
+        # Group by event_title to avoid showing 30+ outcomes for the same event
+        event_groups = {}
+        for m in markets:
+            et = m.get("event_title") or m.get("question") or "Unknown"
+            event_groups.setdefault(et, []).append(m)
+        # Sort each group by volume, sort groups by total volume
+        grouped_markets = []
+        for et, group in sorted(event_groups.items(), key=lambda x: sum(float(m.get("volume") or 0) for m in x[1]), reverse=True):
+            sorted_group = sorted(group, key=lambda m: float(m.get("volume") or 0), reverse=True)
+            grouped_markets.append({
+                "event_title": et,
+                "slug": sorted_group[0].get("slug"),
+                "market_count": len(sorted_group),
+                "total_volume": sum(float(m.get("volume") or 0) for m in sorted_group),
+                "top_market": sorted_group[0],  # highest volume market shown by default
+                "markets": sorted_group[:20],    # cap at 20 outcomes per event
+            })
+        # Filter out event groups whose title doesn't relate to any search term
+        # This catches false positives like "inflation" showing up in "football" results
+        if all_terms:
+            core_query = prompt_lower.split()
+            core_words = [w for w in core_query if len(w) >= 3 and w not in ("show", "me", "markets", "give", "list", "the", "for", "and")]
+            if core_words:
+                filtered_groups = []
+                for g in grouped_markets:
+                    title_lower = g["event_title"].lower()
+                    # Keep if event title contains any core query word OR any of the first 3 search terms
+                    check_terms = core_words + all_terms[:3]
+                    if any(t in title_lower for t in check_terms):
+                        filtered_groups.append(g)
+                # Only apply filter if it doesn't eliminate everything
+                if filtered_groups:
+                    grouped_markets = filtered_groups
+        grouped_markets = grouped_markets[:20]
 
         # Claude may pick symbols, otherwise search dynamically against real available symbols
         # Always validate: fuzzy search first, then use Claude picks only if they overlap or fuzzy found nothing
         fuzzy_syms = _liquid_symbols_for_query(" ".join(all_terms), available_symbols)
         if claude_liquid:
             valid_claude = [s for s in claude_liquid if s in available_symbols]
-            # If fuzzy search found results, only keep Claude picks that fuzzy also found (prevents hallucination)
-            # If fuzzy found nothing, trust Claude's picks
             if fuzzy_syms:
-                syms = list(set(fuzzy_syms + valid_claude))
+                # Only keep Claude picks that fuzzy search ALSO matched (prevents hallucination)
+                fuzzy_set = set(fuzzy_syms)
+                syms = fuzzy_syms + [s for s in valid_claude if s in fuzzy_set]
+                syms = list(dict.fromkeys(syms))  # dedupe preserving order
             else:
                 syms = valid_claude
             logger.info(f"Claude picked: {claude_liquid} -> valid: {valid_claude}, fuzzy: {fuzzy_syms}, final: {syms}")
@@ -243,31 +288,56 @@ async def run_agent(prompt: str) -> dict:
                 except Exception as e:
                     logger.error(f"Error fetching ticker for {s}: {e}")
 
-        # Optionally use Claude to reorder or highlight; keep ALL theme-matched markets on both platforms
-        pm_ids, liq_syms = await _claude_select_batch(prompt, markets, liquid_list)
-        if pm_ids and len(pm_ids) >= 5:
-            filtered = [m for m in markets if str(m.get("market_id")) in pm_ids]
-            if filtered:
-                markets = filtered
-        # Show all Liquid perps for theme (no cap by Claude unless we have many)
-        if liq_syms and len(liq_syms) >= 3:
-            liquid_list = [m for m in liquid_list if m.get("symbol") in liq_syms]
-        # Cap display at sensible limits but show many
-        markets = markets[:40]
+        # Deduplicate Liquid markets: same underlying asset across providers (e.g. xyz:GOLD, cash:GOLD, km:GOLD)
+        # Keep only the highest volume one per underlying ticker
+        # Normalize ticker aliases to a canonical name
+        _ticker_aliases = {
+            "WTI": "OIL", "CL": "OIL", "USOIL": "OIL", "BRENTOIL": "OIL", "USENERGY": "OIL",
+            "GOLDJM": "GOLD", "GLDMINE": "GOLD", "PAXG": "GOLD",
+            "SILVERJM": "SILVER",
+            "USA500": "SP500", "US500": "SP500", "XYZ100": "NASDAQ", "USA100": "NASDAQ", "USTECH": "NASDAQ",
+            "SMALL2000": "RUSSELL", "JPN225": "NIKKEI", "JP225": "NIKKEI",
+        }
+        def _underlying(symbol):
+            """Extract the canonical underlying asset name from any symbol format."""
+            if ":" in symbol:
+                ticker = symbol.split(":")[-1].upper()
+            elif symbol.endswith("-PERP"):
+                ticker = symbol[:-5].upper()
+            else:
+                ticker = symbol.upper()
+            return _ticker_aliases.get(ticker, ticker)
+
+        seen_underlying = {}
+        deduped_liquid = []
+        for m in sorted(liquid_list, key=lambda x: float(x.get("volume_24h") or 0), reverse=True):
+            u = _underlying(m["symbol"])
+            if u not in seen_underlying:
+                seen_underlying[u] = True
+                deduped_liquid.append(m)
+        liquid_list = deduped_liquid
+
         liquid_list = liquid_list[:25]
 
         theme_label = (" ".join(all_terms[:3]) or prompt or "").strip()[:80]
-        has_poly = len(markets) > 0
+        total_markets = sum(g["market_count"] for g in grouped_markets)
+        has_poly = len(grouped_markets) > 0
         has_liquid = len(liquid_list) > 0
         if has_poly and has_liquid:
-            text = f"Found {len(markets)} Polymarket market(s) and {len(liquid_list)} Liquid perp(s) for \"{theme_label}\"."
+            text = f"Found {total_markets} market(s) across {len(grouped_markets)} event(s) and {len(liquid_list)} Liquid perp(s)."
         elif has_poly:
-            text = f"Found {len(markets)} Polymarket market(s) for \"{theme_label}\". No matching Liquid perps."
+            text = f"Found {total_markets} market(s) across {len(grouped_markets)} event(s). No matching Liquid perps."
         elif has_liquid:
-            text = f"No Polymarket markets found for \"{theme_label}\". Found {len(liquid_list)} Liquid perp(s)."
+            text = f"No Polymarket markets found. Found {len(liquid_list)} Liquid perp(s)."
         else:
             text = f"No markets found on either Polymarket or Liquid for \"{theme_label}\". Try a different search term."
-        return {"text": text, "markets": markets if markets else None, "liquid_markets": liquid_list if liquid_list else None, "theme": theme_label}
+        return {
+            "text": text,
+            "event_groups": grouped_markets if grouped_markets else None,
+            "markets": None,  # deprecated, use event_groups
+            "liquid_markets": liquid_list if liquid_list else None,
+            "theme": theme_label,
+        }
 
     if any(x in prompt_lower for x in ("buy", "sell", "order", "trade", "place", "execute")):
         return {

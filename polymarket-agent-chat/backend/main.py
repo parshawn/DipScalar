@@ -115,7 +115,7 @@ async def trending_batches():
     async with httpx.AsyncClient() as client:
         r = await client.get(
             "https://gamma-api.polymarket.com/events",
-            params={"active": "true", "closed": "false", "_limit": 200, "order": "volume", "ascending": "false"},
+            params={"active": "true", "closed": "false", "_limit": 500, "order": "volume", "ascending": "false"},
             timeout=20,
         )
         r.raise_for_status()

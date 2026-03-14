@@ -1,25 +1,18 @@
-import { useState, useRef, useEffect } from 'react'
+import { useState, useRef, useEffect, useCallback } from 'react'
+import DottedSurface from './DottedSurface'
 
 const API = ''
 
-// ── Grid Loading Indicator ──
-function GridLoader({ size = 'md', text }) {
-  const s = size === 'sm' ? 32 : size === 'lg' ? 64 : 48
-  const gap = size === 'sm' ? 2 : 3
-  const cellSize = (s - gap * 2) / 3
+// ── Shimmer Wave Text ──
+function ShimmerText({ text = 'Searching markets...' }) {
   return (
-    <div className="grid-loader">
-      <div className="grid-loader-grid" style={{ width: s, height: s, gap, display: 'grid', gridTemplateColumns: `repeat(3, ${cellSize}px)` }}>
-        {Array.from({ length: 9 }).map((_, i) => (
-          <div
-            key={i}
-            className="grid-loader-cell"
-            style={{ animationDelay: `${i * 0.1}s` }}
-          />
-        ))}
-      </div>
-      {text && <span className="grid-loader-text">{text}</span>}
-    </div>
+    <span className="shimmer-wave">
+      {text.split('').map((char, i) => (
+        <span key={i} className="shimmer-char" style={{ animationDelay: `${i * 0.04}s` }}>
+          {char === ' ' ? '\u00A0' : char}
+        </span>
+      ))}
+    </span>
   )
 }
 
@@ -382,7 +375,7 @@ function ChartModal({ open, title, type, tokenId, symbol, onClose }) {
           ))}
         </div>
         <div className="chart-modal-container">
-          {loading && <div style={{ padding: '2rem', display: 'flex', justifyContent: 'center' }}><GridLoader size="md" text="Loading chart..." /></div>}
+          {loading && <div style={{ padding: '2rem', display: 'flex', justifyContent: 'center' }}><ShimmerText text="Loading chart..." /></div>}
           {!loading && !data && <div style={{ color: '#505662', padding: '1rem', textAlign: 'center' }}>No data available</div>}
           {!loading && data && <FullChart data={data} type={chartType} width={650} height={350} />}
         </div>
@@ -408,7 +401,12 @@ function MarketCard({ market, selection, onSelect, chartData }) {
   return (
     <>
       <div className="market-card">
-        <div className="market-card-question">{market.question || market.event_title}</div>
+        <a
+          className="market-card-question"
+          href={market.slug ? `https://polymarket.com/event/${encodeURIComponent(market.slug)}` : 'https://polymarket.com'}
+          target="_blank"
+          rel="noopener noreferrer"
+        >{market.question || market.event_title}</a>
         <PolySparkline chartData={chartData} onClick={() => tokenId && setChartModal(true)} />
         <div className="market-card-stats">
           {yesPct != null && (
@@ -468,7 +466,12 @@ function LiquidCard({ market, selection, onSelect, chartData }) {
     <>
       <div className="liquid-card">
         <div className="liquid-card-header">
-          <span className="liquid-card-symbol">{market.symbol}</span>
+          <a
+            className="liquid-card-symbol"
+            href={`https://app.tryliquid.xyz/trade/${market.symbol}`}
+            target="_blank"
+            rel="noopener noreferrer"
+          >{market.symbol}</a>
           <span className="liquid-card-price">{fmtPrice(market.mark_price)}</span>
         </div>
         <LiquidSparkline chartData={chartData} onClick={() => setChartModal(true)} />
@@ -521,8 +524,86 @@ function LiquidCard({ market, selection, onSelect, chartData }) {
   )
 }
 
+// ── Event Group (collapsible) ──
+function EventGroup({ group, msgIndex, polySelections, onPolySel, chartCache }) {
+  const [expanded, setExpanded] = useState(false)
+  const getSel = (mid) => polySelections[msgIndex]?.[mid] ?? { outcome: 'yes', amount: 0 }
+  const topMarket = group.top_market
+  const hasMultiple = group.market_count > 1
+  const slug = group.slug
+
+  function renderMarket(m) {
+    let ids = m.clob_token_ids || []
+    if (typeof ids === 'string') try { ids = JSON.parse(ids) } catch { ids = [] }
+    const tokenId = ids[0] || null
+    return (
+      <MarketCard
+        key={m.market_id}
+        market={m}
+        selection={getSel(m.market_id)}
+        onSelect={(sel) => onPolySel(msgIndex, m.market_id, sel)}
+        chartData={tokenId ? chartCache?.[`poly:${tokenId}`] : undefined}
+      />
+    )
+  }
+
+  if (!hasMultiple) {
+    return renderMarket(topMarket)
+  }
+
+  return (
+    <div className={`event-group ${expanded ? 'expanded' : ''}`}>
+      <div className="event-group-header" onClick={() => setExpanded(!expanded)}>
+        <div className="event-group-info">
+          <a
+            className="event-group-title"
+            href={slug ? `https://polymarket.com/event/${encodeURIComponent(slug)}` : '#'}
+            target="_blank"
+            rel="noopener noreferrer"
+            onClick={e => e.stopPropagation()}
+          >{group.event_title}</a>
+          <div className="event-group-meta">
+            <span className="event-count">{group.market_count} outcomes</span>
+            <span>{fmtUsd(group.total_volume)} vol</span>
+          </div>
+        </div>
+        <button className={`event-group-toggle ${expanded ? 'open' : ''}`}>
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><polyline points="6 9 12 15 18 9"/></svg>
+        </button>
+      </div>
+      {!expanded && (
+        <div className="event-group-preview">
+          {renderMarket(topMarket)}
+        </div>
+      )}
+      {expanded && (
+        <div className="event-group-markets">
+          {group.markets.map(m => renderMarket(m))}
+        </div>
+      )}
+    </div>
+  )
+}
+
 // ── Polymarket Markets Block ──
-function MarketsBlock({ msgIndex, markets, polySelections, onPolySel, chartCache }) {
+function MarketsBlock({ msgIndex, eventGroups, markets, polySelections, onPolySel, chartCache }) {
+  // Use event_groups if available, otherwise fall back to flat markets
+  if (eventGroups?.length) {
+    return (
+      <div className="market-cards">
+        {eventGroups.map((g, i) => (
+          <EventGroup
+            key={g.event_title || i}
+            group={g}
+            msgIndex={msgIndex}
+            polySelections={polySelections}
+            onPolySel={onPolySel}
+            chartCache={chartCache}
+          />
+        ))}
+      </div>
+    )
+  }
   if (!markets?.length) return null
   const getSel = (mid) => polySelections[msgIndex]?.[mid] ?? { outcome: 'yes', amount: 0 }
   return (
@@ -658,6 +739,14 @@ export default function App() {
   const [chartCaches, setChartCaches] = useState({}) // msgIndex -> { "poly:tokenId": data, "liquid:symbol": data }
   const [trendingBatches, setTrendingBatches] = useState(null)
   const bottomRef = useRef(null)
+  const textareaRef = useRef(null)
+
+  const adjustTextarea = useCallback(() => {
+    const ta = textareaRef.current
+    if (!ta) return
+    ta.style.height = '0'
+    ta.style.height = Math.min(ta.scrollHeight, 160) + 'px'
+  }, [])
 
   useEffect(() => { bottomRef.current?.scrollIntoView({ behavior: 'smooth' }) }, [messages])
 
@@ -748,6 +837,7 @@ export default function App() {
     const prompt = (promptOverride ?? input).trim()
     if (!prompt || loading) return
     setInput('')
+    if (textareaRef.current) textareaRef.current.style.height = ''
     setMessages(m => [...m, { role: 'user', content: prompt }])
     setLoading(true)
     try {
@@ -757,17 +847,20 @@ export default function App() {
         body: JSON.stringify({ prompt }),
       })
       const data = await res.json()
+      // Flatten event_groups into markets for chart fetching
+      const flatMarkets = (data.event_groups || []).flatMap(g => g.markets || [])
       setMessages(m => {
         const newMsgs = [...m, {
           role: 'assistant',
           text: data.text ?? '',
-          markets: data.markets ?? null,
+          event_groups: data.event_groups ?? null,
+          markets: flatMarkets.length > 0 ? flatMarkets : (data.markets ?? null),
           liquid_markets: data.liquid_markets ?? null,
           theme: data.theme ?? null,
         }]
-        // Batch-fetch all chart data in parallel
         const msgIdx = newMsgs.length - 1
-        fetchBatchCharts(data.markets, data.liquid_markets).then(cache => {
+        const marketsForCharts = flatMarkets.length > 0 ? flatMarkets : data.markets
+        fetchBatchCharts(marketsForCharts, data.liquid_markets).then(cache => {
           setChartCaches(prev => ({ ...prev, [msgIdx]: cache }))
         })
         return newMsgs
@@ -792,6 +885,7 @@ export default function App() {
 
   return (
     <div className="app">
+      <DottedSurface visible={messages.length === 0} />
       <header className="header">
         <h1>DipScalar</h1>
         <p>Cross-platform batch trading terminal</p>
@@ -799,8 +893,13 @@ export default function App() {
 
       <div className="chat">
         {messages.length === 0 && (
-          <div className="placeholder">
-            <p>Search markets or pick a trending category</p>
+          <div className="landing">
+            <div className="landing-glow" />
+            <div className="landing-hero">
+              <h2 className="landing-title">What would you like to trade?</h2>
+              <div className="landing-divider" />
+              <p className="landing-sub">Search any market, asset, or theme across Polymarket and Liquid</p>
+            </div>
             {trendingBatches === null ? (
               <div className="batch-loading">Loading trending markets...</div>
             ) : trendingBatches.length > 0 ? (
@@ -846,7 +945,7 @@ export default function App() {
                 <div className="batch-grid">
                   <div className="batch-col">
                     <div className="batch-label">Polymarket{msg.theme ? ` — ${msg.theme}` : ''}</div>
-                    <MarketsBlock msgIndex={i} markets={msg.markets} polySelections={polymarketSelections} onPolySel={setPolySel} chartCache={chartCaches[i]} />
+                    <MarketsBlock msgIndex={i} eventGroups={msg.event_groups} markets={msg.markets} polySelections={polymarketSelections} onPolySel={setPolySel} chartCache={chartCaches[i]} />
                   </div>
                   <div className="batch-col">
                     <div className="batch-label">Liquid Perps{msg.theme ? ` — ${msg.theme}` : ''}</div>
@@ -920,21 +1019,33 @@ export default function App() {
         {loading && (
           <div className="msg assistant">
             <span className="role">Agent</span>
-            <GridLoader size="sm" text="Searching markets..." />
+            <ShimmerText text="Searching markets..." />
           </div>
         )}
         <div ref={bottomRef} />
       </div>
 
-      <div className="input-row">
-        <input
-          value={input}
-          onChange={e => setInput(e.target.value)}
-          onKeyDown={e => e.key === 'Enter' && !e.shiftKey && send()}
-          placeholder="Search markets or describe a trade..."
-          disabled={loading}
-        />
-        <button onClick={() => send()} disabled={loading || !input.trim()}>Send</button>
+      <div className="input-glass">
+        <div className="input-glass-inner">
+          <textarea
+            ref={textareaRef}
+            value={input}
+            onChange={e => { setInput(e.target.value); adjustTextarea() }}
+            onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send() } }}
+            placeholder="Search markets or describe a trade..."
+            disabled={loading}
+            rows={1}
+            className="input-textarea"
+          />
+          <button
+            className={`input-send ${input.trim() ? 'active' : ''}`}
+            onClick={() => send()}
+            disabled={loading || !input.trim()}
+          >
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
+            <span>Send</span>
+          </button>
+        </div>
       </div>
 
       <ConfirmModal

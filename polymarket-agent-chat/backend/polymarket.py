@@ -52,14 +52,29 @@ def flatten_markets(events: list[dict]) -> list[dict]:
 
 
 def filter_by_query(markets: List[dict], query: str, extra_terms: Optional[List[str]] = None) -> List[dict]:
-    """Keyword filter; match query or any of extra_terms against title + question."""
+    """Keyword filter with word-boundary matching to avoid false positives like 'nfl' in 'inflation'."""
+    import re
     q = (query or "").strip().lower()
     terms = [q] if q else []
     if extra_terms:
         terms = list(terms) + [t.lower() for t in extra_terms]
     if not terms:
         return markets
+    # Build regex patterns: word-boundary for short terms, prefix-match for longer ones
+    patterns = []
+    for term in terms:
+        if not term:
+            continue
+        escaped = re.escape(term)
+        # For terms 4+ chars, allow prefix matching (e.g. "rate" matches "rates", "fed" matches "federal")
+        if len(term) >= 4:
+            patterns.append(re.compile(r'\b' + escaped, re.IGNORECASE))
+        else:
+            # Short terms (nfl, oil, fed, etc.) need strict word boundaries to avoid false positives
+            patterns.append(re.compile(r'\b' + escaped + r'\b', re.IGNORECASE))
+    if not patterns:
+        return markets
     def matches(m):
-        t = ((m.get("event_title") or "") + " " + (m.get("question") or "")).lower()
-        return any(term in t for term in terms)
+        t = ((m.get("event_title") or "") + " " + (m.get("question") or ""))
+        return any(p.search(t) for p in patterns)
     return [m for m in markets if matches(m)]
