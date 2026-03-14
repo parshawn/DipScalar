@@ -1,0 +1,7 @@
+fastapi
+uvicorn[standard]
+httpx
+anthropic
+liquidtrading-python
+py-clob-client
+python-dotenv
