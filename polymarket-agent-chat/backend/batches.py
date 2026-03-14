@@ -1,0 +1,58 @@
+"""Premade batch suggestions — curated market + perps combos with dynamic symbol resolution."""
+
+CURATED_BATCHES = [
+    {
+        "id": "oil-hedge",
+        "title": "Oil Shock",
+        "subtitle": "Geopolitical oil exposure",
+        "icon": "oil",
+        "thesis": "Oil supply disruption play. Polymarket events on Middle East + oil prices, hedged with crude/energy perps.",
+        "polymarket_queries": ["oil", "crude", "opec", "energy"],
+        "liquid_search_terms": ["oil", "cl", "brent", "wti", "energy", "natgas"],
+    },
+    {
+        "id": "crypto-bull",
+        "title": "Crypto Bull",
+        "subtitle": "Long crypto conviction",
+        "icon": "crypto",
+        "thesis": "Bullish crypto across prediction markets and perps. BTC/ETH/SOL longs with Polymarket crypto event exposure.",
+        "polymarket_queries": ["bitcoin", "btc", "ethereum", "crypto"],
+        "liquid_search_terms": ["btc", "eth", "sol", "xrp", "doge"],
+    },
+    {
+        "id": "election-play",
+        "title": "Election Play",
+        "subtitle": "US political markets",
+        "icon": "election",
+        "thesis": "Election and policy prediction markets paired with macro perps that move on political outcomes.",
+        "polymarket_queries": ["trump", "election", "president", "republican", "democrat"],
+        "liquid_search_terms": ["trump", "btc", "eth", "gold"],
+    },
+    {
+        "id": "gold-safety",
+        "title": "Gold Safety",
+        "subtitle": "Flight to safety",
+        "icon": "gold",
+        "thesis": "Gold and silver long as safe haven paired with recession/rate cut prediction markets.",
+        "polymarket_queries": ["gold", "fed", "rate", "recession", "inflation"],
+        "liquid_search_terms": ["gold", "silver", "paxg"],
+    },
+    {
+        "id": "iran-escalation",
+        "title": "Iran Escalation",
+        "subtitle": "Middle East conflict exposure",
+        "icon": "iran",
+        "thesis": "Iran/Israel conflict play. Oil up on escalation, gold as hedge, prediction markets on conflict outcomes.",
+        "polymarket_queries": ["iran", "israel", "middle east", "escalat", "geopolit"],
+        "liquid_search_terms": ["oil", "cl", "brent", "gold", "defense"],
+    },
+    {
+        "id": "degen-basket",
+        "title": "Degen Basket",
+        "subtitle": "High-volume, high-volatility",
+        "icon": "degen",
+        "thesis": "Top trending markets by volume + leveraged crypto perps. Maximum exposure to market momentum.",
+        "polymarket_queries": [],
+        "liquid_search_terms": ["btc", "eth", "sol", "doge", "trump"],
+    },
+]

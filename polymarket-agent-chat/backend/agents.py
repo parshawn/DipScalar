@@ -16,7 +16,7 @@ def _liquid_symbols_for_query(query: str, available_symbols: list[str]) -> list[
     q = (query or "").strip().lower()
     search_words = [w for w in q.split() if len(w) >= 2]
     if not search_words:
-        return [s for s in available_symbols if "BTC" in s.upper()][:3]
+        return []
     out = []
     for sym in available_symbols:
         sym_lower = sym.lower()
@@ -29,7 +29,7 @@ def _liquid_symbols_for_query(query: str, available_symbols: list[str]) -> list[
                 out.append(sym)
                 break
     logger.info(f"_liquid_symbols_for_query({q!r}) words={search_words} -> matched {len(out)}: {out}")
-    return out if out else [s for s in available_symbols if "BTC" in s.upper()][:3]
+    return out
 
 
 def _short_query_from_prompt(prompt: str) -> str:
@@ -61,9 +61,15 @@ async def _claude_parse_request(prompt: str, available_liquid_symbols: list[str]
                     "stocks like xyz:NVDA, indices like abcd:USA500): " + ", ".join(symbols_preview) + "\n\n"
                     "Reply with ONLY valid JSON, no markdown or explanation. Keys: "
                     '"intent" (one of: markets, trade, general), '
-                    '"search_terms" (array of 2-8 words/phrases to find related Polymarket prediction markets, e.g. iran, geopolit, oil, election), '
-                    '"liquid_symbols" (array of 0-15 symbols from the EXACT available list above that fit the user request; '
-                    'include ALL relevant symbols across different providers like xyz:, flx:, km:, cash:, hyna: prefixes; if empty we show defaults).'
+                    '"search_terms" (array of 5-15 individual keywords/phrases to find related Polymarket prediction markets. '
+                    'Be EXHAUSTIVE — include the main term AND all synonyms, related concepts, sub-topics, and key entities. '
+                    'For example: "economy" -> ["fed", "rate", "recession", "inflation", "gdp", "tariff", "treasury", "unemployment", "economic", "jobs", "cpi"]. '
+                    '"sports" -> ["nba", "nfl", "mlb", "nhl", "soccer", "football", "basketball", "baseball", "champion", "finals", "premier league", "world cup"]. '
+                    'Think about what words would appear in prediction market QUESTIONS about this topic), '
+                    '"liquid_symbols" (array of 0-15 symbols from the EXACT available list above that DIRECTLY relate to the user request; '
+                    'include ALL relevant symbols across different providers like xyz:, flx:, km:, cash:, hyna: prefixes. '
+                    'IMPORTANT: only include symbols that are genuinely related to the query. If nothing matches, return an empty array. '
+                    'Do NOT include random or loosely related symbols just to fill the list).'
                 )
             }]
         )
@@ -73,7 +79,7 @@ async def _claude_parse_request(prompt: str, available_liquid_symbols: list[str]
         data = json.loads(raw)
         return {
             "intent": (data.get("intent") or "general").lower()[:20],
-            "search_terms": [str(t).strip() for t in (data.get("search_terms") or []) if str(t).strip()][:12],
+            "search_terms": [str(t).strip() for t in (data.get("search_terms") or []) if str(t).strip()][:20],
             "liquid_symbols": [str(s).strip() for s in (data.get("liquid_symbols") or []) if str(s).strip()][:20],
         }
     except Exception:
@@ -145,10 +151,8 @@ async def _claude_select_batch(prompt: str, markets: list[dict], liquid: list[di
         msg = await client.messages.create(
             model="claude-haiku-4-5-20251001",
             max_tokens=600,
-            messages=[
-                {"role": "system", "content": system_msg},
-                user_msg,
-            ],
+            system=system_msg,
+            messages=[user_msg],
         )
         block = msg.content[0]
         raw = block.text if hasattr(block, "text") else str(block)
@@ -193,40 +197,34 @@ async def run_agent(prompt: str) -> dict:
     )
 
     if wants_data:
-        # Build Polymarket filter: use Claude search_terms when present, else legacy query
+        # Build Polymarket filter: use ALL search terms as OR query
         if search_terms:
-            query = search_terms[0]
-            extra = search_terms[1:] if len(search_terms) > 1 else None
+            all_terms = [t.lower().strip() for t in search_terms if t.strip()]
         else:
-            query = _short_query_from_prompt(prompt)
-            extra = None
+            q = _short_query_from_prompt(prompt)
+            all_terms = [q] if q else []
 
-        events = await fetch_events(limit=200)
+        events = await fetch_events(limit=500)
         all_markets = flatten_markets(events)
-        markets = filter_by_query(all_markets, query, extra_terms=extra)
-        if not markets and (search_terms or query):
-            for term in (search_terms or [query]):
-                if not term or len(term) < 2:
-                    continue
-                markets = filter_by_query(all_markets, term)
-                if markets:
-                    break
-        if not markets:
-            markets = sorted(
-                all_markets,
-                key=lambda m: float(m.get("volume") or 0),
-                reverse=True,
-            )[:30]
-            query = ""
-        else:
-            markets = markets[:60]
+        # Search with all terms at once (OR logic)
+        markets = filter_by_query(all_markets, all_terms[0] if all_terms else "", extra_terms=all_terms[1:] if len(all_terms) > 1 else None)
+        # Sort by volume so best markets come first
+        markets = sorted(markets, key=lambda m: float(m.get("volume") or 0), reverse=True)[:60]
 
         # Claude may pick symbols, otherwise search dynamically against real available symbols
+        # Always validate: fuzzy search first, then use Claude picks only if they overlap or fuzzy found nothing
+        fuzzy_syms = _liquid_symbols_for_query(" ".join(all_terms), available_symbols)
         if claude_liquid:
-            syms = [s for s in claude_liquid if s in available_symbols]
-            logger.info(f"Claude picked liquid symbols: {claude_liquid} -> valid: {syms}")
+            valid_claude = [s for s in claude_liquid if s in available_symbols]
+            # If fuzzy search found results, only keep Claude picks that fuzzy also found (prevents hallucination)
+            # If fuzzy found nothing, trust Claude's picks
+            if fuzzy_syms:
+                syms = list(set(fuzzy_syms + valid_claude))
+            else:
+                syms = valid_claude
+            logger.info(f"Claude picked: {claude_liquid} -> valid: {valid_claude}, fuzzy: {fuzzy_syms}, final: {syms}")
         else:
-            syms = _liquid_symbols_for_query(query or " ".join(search_terms), available_symbols)
+            syms = fuzzy_syms
         logger.info(f"Final Liquid symbols to fetch tickers for: {syms}")
         liquid_list: list[dict] = []
         for m in (all_liq_raw or []):
@@ -258,13 +256,17 @@ async def run_agent(prompt: str) -> dict:
         markets = markets[:40]
         liquid_list = liquid_list[:25]
 
-        if markets:
-            text = f"Found {len(markets)} Polymarket markets." if query else f"No theme-specific match; showing top {len(markets)} markets by volume."
+        theme_label = (" ".join(all_terms[:3]) or prompt or "").strip()[:80]
+        has_poly = len(markets) > 0
+        has_liquid = len(liquid_list) > 0
+        if has_poly and has_liquid:
+            text = f"Found {len(markets)} Polymarket market(s) and {len(liquid_list)} Liquid perp(s) for \"{theme_label}\"."
+        elif has_poly:
+            text = f"Found {len(markets)} Polymarket market(s) for \"{theme_label}\". No matching Liquid perps."
+        elif has_liquid:
+            text = f"No Polymarket markets found for \"{theme_label}\". Found {len(liquid_list)} Liquid perp(s)."
         else:
-            text = "No matching Polymarket markets for that theme."
-        if liquid_list:
-            text += f" {len(liquid_list)} Liquid perp(s) — set size and click Execute to place orders."
-        theme_label = (query or " ".join(search_terms) or prompt or "").strip()[:80]
+            text = f"No markets found on either Polymarket or Liquid for \"{theme_label}\". Try a different search term."
         return {"text": text, "markets": markets if markets else None, "liquid_markets": liquid_list if liquid_list else None, "theme": theme_label}
 
     if any(x in prompt_lower for x in ("buy", "sell", "order", "trade", "place", "execute")):
