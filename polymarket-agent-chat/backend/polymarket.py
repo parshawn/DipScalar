@@ -60,17 +60,17 @@ def filter_by_query(markets: List[dict], query: str, extra_terms: Optional[List[
         terms = list(terms) + [t.lower() for t in extra_terms]
     if not terms:
         return markets
-    # Build regex patterns: word-boundary for short terms, prefix-match for longer ones
+    # Build regex patterns with word boundaries
     patterns = []
     for term in terms:
         if not term:
             continue
         escaped = re.escape(term)
-        # For terms 4+ chars, allow prefix matching (e.g. "rate" matches "rates", "fed" matches "federal")
         if len(term) >= 4:
+            # 4+ chars: prefix-match so "rate" matches "rates", "inflation" matches "inflationary"
             patterns.append(re.compile(r'\b' + escaped, re.IGNORECASE))
         else:
-            # Short terms (nfl, oil, fed, etc.) need strict word boundaries to avoid false positives
+            # Short terms: strict word boundaries to avoid "nfl" in "inflation"
             patterns.append(re.compile(r'\b' + escaped + r'\b', re.IGNORECASE))
     if not patterns:
         return markets
