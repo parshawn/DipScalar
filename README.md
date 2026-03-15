@@ -1,212 +1,388 @@
-# AI Batch Trading Terminal
+# DipScalar
 
-## One-liner
+**Cross-platform batch trading terminal combining Polymarket prediction markets with Liquid perpetual futures.**
 
-An AI-powered terminal where users type a theme (e.g. "Oil", "Iran", "Crypto") and get a cross-platform batch of **Polymarket** prediction markets and **Liquid** perpetual futures, with one-click execution on both.
+DipScalar lets you search for any market theme using natural language — "show me Venezuela markets", "hedge against inflation", "crypto bull run" — and instantly see relevant prediction markets and tradeable perpetual futures side-by-side. Build a thematic batch and execute trades across both platforms in one click.
+
+![Dark terminal UI](https://img.shields.io/badge/UI-Dark_Terminal-131518?style=flat-square) ![Python](https://img.shields.io/badge/Backend-Python_3.11-3776AB?style=flat-square&logo=python&logoColor=white) ![React](https://img.shields.io/badge/Frontend-React_18-61DAFB?style=flat-square&logo=react&logoColor=black) ![Claude](https://img.shields.io/badge/AI-Claude_Haiku-D97757?style=flat-square)
 
 ---
 
-## Workflow: 0 → 100 (code path)
+## What It Does
 
-End-to-end flow from user input to executed orders.
+1. **Type any theme** into the chatbot — "oil markets", "Venezuela", "hedge against inflation", "crypto bull run"
+2. **AI agent interprets your intent** and searches across both Polymarket and Liquid simultaneously
+3. **View grouped results** — prediction markets collapsed by event with sparkline charts, perpetual futures with live prices and leverage info
+4. **Configure your batch** — set Yes/No positions on prediction markets, Long/Short on perps, adjust sizes and leverage
+5. **Execute everything in one click** — trades are placed on both venues simultaneously
 
-### 1. User input (frontend)
+---
 
-- **File:** `polymarket-agent-chat/frontend/src/App.jsx`
-- User types in the input bar or clicks a quick theme (Oil, Crypto, Iran, Trump, Gold) or an example prompt.
-- `send(prompt)` is called: it appends a user message, sets `loading`, and `POST`s to the backend.
+## How It Works
 
-```text
-POST /agent  body: { prompt: "Show me oil markets" }
+### The Core Loop
+
+```
+User prompt ──► Claude Haiku parses intent + generates search terms
+                    │
+        ┌───────────┴───────────┐
+        ▼                       ▼
+  Polymarket Gamma API    Liquid SDK (~370 symbols)
+  /public-search          get_markets() + get_ticker()
+  (server-side search)    (crypto, commodities, stocks, indices)
+        │                       │
+        └───────────┬───────────┘
+                    ▼
+        Group by event, deduplicate,
+        merge into themed batch
+                    │
+                    ▼
+        Frontend renders cards with
+        sparklines, prices, trade controls
+                    │
+                    ▼
+        POST /execute ──► simultaneous orders
+        on Polymarket CLOB + Liquid
+```
+
+### Architecture
+
+```
+┌─────────────────────────────────────────────────┐
+│                   Frontend                       │
+│            React 18 + Vite 5 + Three.js          │
+│                                                  │
+│  ┌─────────┐  ┌──────────┐  ┌────────────────┐  │
+│  │ Chat UI │  │ Market   │  │ Chart Modals   │  │
+│  │ (Input) │  │ Cards    │  │ (Canvas-based) │  │
+│  └────┬────┘  └────┬─────┘  └───────┬────────┘  │
+└───────┼────────────┼────────────────┼────────────┘
+        │            │                │
+        ▼            ▼                ▼
+┌─────────────────────────────────────────────────┐
+│                 Backend (FastAPI)                 │
+│                                                  │
+│  POST /agent ──► Agent Orchestrator              │
+│       │          (Claude Haiku parsing)           │
+│       │              │                            │
+│       │    ┌─────────┴──────────┐                │
+│       │    ▼                    ▼                 │
+│       │  Polymarket           Liquid              │
+│       │  Gamma API            SDK                 │
+│       │  /public-search       get_markets()       │
+│       │  (server-side)        get_ticker()        │
+│       │                                           │
+│  POST /execute ──► Place orders on both venues    │
+│  POST /batch-charts ──► Parallel chart data fetch │
+│  GET  /trending-batches ──► Category discovery    │
+│  GET  /candles ──► Liquid OHLCV data              │
+│  GET  /prices-history ──► Polymarket price data   │
+└─────────────────────────────────────────────────┘
 ```
 
 ---
 
-### 2. Backend receives prompt
+## Tech Stack
 
-- **File:** `polymarket-agent-chat/backend/main.py`
-- `agent_endpoint(req: AgentRequest)` receives the prompt and calls `run_agent(req.prompt)`.
+### Backend — Python / FastAPI
 
----
+| Component | Technology | Purpose |
+|-----------|-----------|---------|
+| **Web Framework** | [FastAPI](https://fastapi.tiangolo.com/) | Async REST API with automatic OpenAPI docs |
+| **AI Agent** | [Claude Haiku](https://docs.anthropic.com/) (claude-haiku-4-5) via Anthropic SDK | Natural language parsing, search term generation, symbol matching |
+| **Polymarket Data** | [Gamma API](https://docs.polymarket.com/) (`gamma-api.polymarket.com`) | Server-side market search via `/public-search`, event discovery — no auth needed |
+| **Polymarket Trading** | [CLOB API](https://docs.polymarket.com/) via `py-clob-client` | Order placement (requires API keys + private key for on-chain signing) |
+| **Liquid Data + Trading** | [`liquidtrading-python`](https://pypi.org/project/liquidtrading-python/) SDK v0.1.3 | ~370 perpetual futures — crypto, commodities, stocks, indices. Routes through Hyperliquid |
+| **HTTP Client** | [httpx](https://www.python-httpx.org/) | Async HTTP requests to external APIs |
+| **Environment** | [python-dotenv](https://pypi.org/project/python-dotenv/) | Secure credential management from `.env` |
+| **Server** | [Uvicorn](https://www.uvicorn.org/) | ASGI server with hot-reload |
+| **Container** | Docker (Python 3.11-slim) | Production deployment |
 
-### 3. Agent: Liquid symbol list
+### Frontend — React / Vite
 
-- **File:** `polymarket-agent-chat/backend/agents.py` → `run_agent()`
-- First, the agent loads the list of Liquid symbols (for both Claude and later filtering):
-  - Calls `get_liquid_markets()` in `liquid.py`, which uses the Liquid SDK and returns `[{ symbol, max_leverage }, ...]`.
-  - If the Liquid API or credentials are missing, `available_symbols` stays empty; the rest still runs.
+| Component | Technology | Purpose |
+|-----------|-----------|---------|
+| **Framework** | [React 18](https://react.dev/) | Component-based UI |
+| **Build Tool** | [Vite 5](https://vitejs.dev/) | Fast HMR, dev proxy to backend |
+| **3D Background** | [Three.js](https://threejs.org/) | Animated dotted wave surface on landing page |
+| **Charts** | Pure HTML5 Canvas | Sparklines and expanded candlestick/area charts |
+| **Styling** | Vanilla CSS with CSS variables | Dark trading terminal theme, glassmorphic effects |
+| **Font** | [Inter](https://fonts.google.com/specimen/Inter) (Google Fonts) | Clean, readable typography for financial data |
 
----
+### Deployment
 
-### 4. Agent: Claude parses the request
-
-- **File:** `agents.py` → `_claude_parse_request(prompt, available_symbols)`
-- If `ANTHROPIC_API_KEY` is set, one Claude call is made with:
-  - The user message
-  - A short list of available Liquid symbols
-- Claude returns JSON:
-  - **`intent`**: `"markets"` | `"trade"` | `"general"`
-  - **`search_terms`**: 2–8 words/phrases for filtering Polymarket (e.g. oil, crude, opec, wti)
-  - **`liquid_symbols`**: 0–15 Liquid perp symbols that fit the theme (e.g. CL-PERP, GC-PERP)
-- If Claude isn’t used or fails, `intent="general"`, `search_terms=[]`, `liquid_symbols=[]`.
-
----
-
-### 5. Agent: Decide if we show markets
-
-- **File:** `agents.py` → `run_agent()`
-- `wants_data` is true if:
-  - Claude said `intent` is `"markets"` or `"trade"`, or
-  - The prompt contains keywords like "show", "list", "find", "markets", "oil", "crypto", "bets", etc.
-- If not `wants_data`, the agent returns a short help message and no markets; flow stops.
+| Service | Purpose |
+|---------|---------|
+| **Vercel** | Frontend static hosting (React build output) |
+| **Railway** | Backend container hosting (Docker / FastAPI) |
+| **Supabase** | Database (user state, watchlists, order history — if needed) |
 
 ---
 
-### 6. Agent: Polymarket fetch and filter
+## Backend Implementation
 
-- **File:** `agents.py` → `polymarket.py`
-- **Fetch:** `fetch_events(limit=200)` → GET Gamma API `https://gamma-api.polymarket.com/events`, returns raw events.
-- **Flatten:** `flatten_markets(events)` turns each event’s markets into a flat list with `event_title`, `question`, `market_id`, `condition_id`, `slug`, `yes_price`, `volume`, `clob_token_ids`, etc.
-- **Filter:** `filter_by_query(all_markets, query, extra_terms)`:
-  - Uses Claude’s `search_terms` when present (first term = `query`, rest = `extra_terms`).
-  - Otherwise uses `_short_query_from_prompt(prompt)` and optionally `QUERY_EXPANSION` (e.g. "iran" → geopolit, fifa, oil).
-  - Keeps markets whose title + question contain any of the terms.
-- **Fallbacks:** If no match, tries each search term alone; if still none, returns top 30 markets by volume. Result is capped at 60, then 40 for display.
+### Agent Orchestrator (`agents.py`)
 
----
+The core intelligence layer. When a user sends a message, this is what happens:
 
-### 7. Agent: Liquid list for the batch
+**Step 1: Claude Haiku Parsing** (`_claude_parse_request()`)
 
-- **File:** `agents.py` → `liquid.py`
-- **Symbols:** If Claude returned `liquid_symbols`, use those; else `_liquid_symbols_for_query()` (THEME_SYMBOLS map + default BTC, ETH, CL, GC).
-- For each symbol in that set, find it in `all_liq_raw` and call `get_ticker(symbol)` for mark price and volume; build `liquid_list` with `symbol`, `max_leverage`, `mark_price`, `volume_24h`.
-- If the API failed but we have symbols, append placeholder rows (no price/volume). List is capped at 25.
+Sends the user prompt + all ~370 available Liquid symbols to Claude Haiku in one call. Claude returns:
+- `intent`: "markets", "trade", or "general"
+- `search_terms`: 10-20 keywords including topic words, related people, places, actions, and multi-word phrases
+- `liquid_symbols`: Exact symbols from the available list that relate to the query
 
----
+For example, "show me Venezuela markets" produces:
+```json
+{
+  "intent": "markets",
+  "search_terms": ["venezuela", "venezuelan", "maduro", "machado", "caracas", "invade", "coup", "sanctions", "oil production", "exile"],
+  "liquid_symbols": ["xyz:CL", "flx:OIL", "cash:WTI"]
+}
+```
 
-### 8. Agent: Optional Claude batch refinement
+**Step 2: Server-Side Polymarket Search**
 
-- **File:** `agents.py` → `_claude_select_batch(prompt, markets, liquid_list)`
-- Second Claude call: given the current Polymarket and Liquid lists, Claude returns `polymarket_ids` and `liquid_symbols` to emphasize.
-- Used only if Claude returns ≥5 Polymarket IDs or ≥3 Liquid symbols; otherwise the existing lists are kept to avoid over-narrowing.
-- Final `markets` and `liquid_list` are trimmed to 40 and 25 items.
+Uses the Gamma API `/public-search` endpoint with multiple search terms queried in parallel. Results are merged and deduplicated by event slug. This replaced the original approach of fetching 500 events and filtering client-side — which missed most results since Polymarket has ~9,000 events.
 
----
+**Step 3: Liquid Symbol Resolution**
 
-### 9. Agent: Response to frontend
+Two-layer validation to prevent hallucinated symbols:
+1. `_liquid_symbols_for_query()` does fuzzy matching against real available symbols (exact match for short tickers, substring only if both are 4+ chars to prevent "nfl" matching "nflx")
+2. Claude's picks are validated against fuzzy results
 
-- **File:** `agents.py` → `run_agent()`
-- Returns:
-  - `text`: Short summary (e.g. "Found N Polymarket markets. M Liquid perp(s) — set size and click Execute.")
-  - `markets`: Polymarket list (with `market_id`, `question`, `yes_price`, `volume`, `slug`, `clob_token_ids`, etc.)
-  - `liquid_markets`: Liquid list (symbol, mark_price, volume_24h, max_leverage)
-  - `theme`: Label for the batch (e.g. "oil" or "Iran escalation")
+**Step 4: Event Grouping**
 
----
+Markets are grouped by parent event title. Each group shows the top market by volume with an expand button to see all outcomes. "2026 FIFA World Cup Winner" with 50+ outcome markets becomes one collapsible card.
 
-### 10. Frontend: Render batch card
+**Step 5: Liquid Deduplication**
 
-- **File:** `polymarket-agent-chat/frontend/src/App.jsx`
-- Assistant message is appended with `text`, `markets`, `liquid_markets`, `theme`.
-- **Batch grid:** Two columns.
-  - **Polymarket:** `MarketsBlock` — table with Question, Yes %, Volume, Bet (Yes/No), Amount ($), Chart (link to `polymarket.com/event/{slug}`). Inline bar for Yes %.
-  - **Liquid:** `LiquidBlock` — Batch budget ($), "Use suggested (equal split)", table with Symbol, Mark, Vol 24h, Side (Long/Short), Alloc %, Size ($), Leverage.
-- State: `polymarketSelections[msgIndex][marketId] = { outcome, amount }`, `liquidSelections[msgIndex][symbol] = { side, size, leverage }`, `batchBudget[msgIndex]`.
+The same asset often exists across multiple Liquid providers (e.g. `xyz:GOLD`, `cash:GOLD`, `km:GOLD`, `flx:GOLD`, `hyna:GOLD`). A ticker alias map normalizes these, and only the highest-volume provider is kept.
 
----
+### Polymarket Client (`polymarket.py`)
 
-### 11. User configures and clicks Execute
+Three search strategies:
+- **`search_events(query)`** — Uses `/public-search` for server-side text search with pagination
+- **`fetch_events_by_tag(tag_slug)`** — Fetches events by Polymarket tag (e.g. "venezuela", "crypto")
+- **`filter_by_query(markets, query)`** — Client-side regex filter with word-boundary matching. Short terms (<4 chars) use strict boundaries (`\bnfl\b`) to avoid "nfl" matching "inflation". Longer terms use prefix-matching (`\binflat`) so "inflation" matches "inflationary"
 
-- User sets Polymarket bets (Yes/No + $) and Liquid orders (side, size, leverage), optionally "Use suggested (equal split)" from batch budget.
-- When at least one Liquid size &gt; 0 or one Polymarket amount &gt; 0, an "Execute batch" button and allocation bar (Liquid vs Polymarket) appear.
-- Clicking it calls `openConfirm(msgIndex, liquidOrders, polyOrders)`:
-  - `liquidOrders` = rows with `size > 0` from `liquidSelections[msgIndex]`.
-  - `polyOrders` = `buildPolymarketOrders(msg.markets, polymarketSelections[msgIndex])`: markets with `amount > 0`, mapping Yes/No to the correct `clob_token_ids` token and setting `price_limit` from yes_price + buffer or 0.99.
+### Liquid Client (`liquid.py`)
 
----
+Wraps the `liquidtrading-python` SDK with async support via `asyncio.to_thread()`:
+- **`get_liquid_markets()`** — Returns all ~370 available symbols with max leverage
+- **`get_ticker(symbol)`** — Live mark price, 24h volume, funding rate
+- **`get_candles(symbol)`** — OHLCV candlestick data
+- **`place_order(symbol, side, size, leverage)`** — Market order execution
 
-### 12. Confirmation modal
+Liquid symbols span multiple providers and asset classes:
+```
+Crypto:       BTC-PERP, ETH-PERP, SOL-PERP, DOGE-PERP, ...
+Commodities:  xyz:CL, flx:OIL, cash:WTI, flx:GOLD, xyz:SILVER, ...
+Stocks:       xyz:NVDA, km:AAPL, cash:TSLA, xyz:AMZN, ...
+Indices:      flx:USA500, km:USTECH, xyz:XYZ100, km:JPN225, ...
+Thematic:     vntl:DEFENSE, vntl:NUCLEAR, vntl:SPACEX, vntl:BIOTECH, ...
+```
 
-- **File:** `App.jsx` → `ConfirmModal`
-- Shows counts and list of Liquid orders (Long/Short symbol $size leverage) and Polymarket bets ($amount).
-- User confirms → `confirmExecute()`.
+### Polymarket CLOB Client (`polymarket_clob.py`)
 
----
+Handles order placement on Polymarket via the `py-clob-client` SDK:
+- Uses Fill-Or-Kill (FOK) market orders
+- Requires API key, secret, passphrase, and a private key for on-chain signing (Polygon network)
+- Each order specifies a `token_id` (identifying Yes/No outcome), `amount_usd`, and `price_limit` (slippage)
 
-### 13. Execute API request
+### API Endpoints (`main.py`)
 
-- **File:** `App.jsx` → `confirmExecute()`
-- `POST /execute` with:
-  - `liquid_orders`: `[{ symbol, side, size, leverage }]`
-  - `polymarket_orders`: `[{ token_id, amount_usd, price_limit }]`
-
----
-
-### 14. Backend execute endpoint
-
-- **File:** `polymarket-agent-chat/backend/main.py` → `execute_endpoint(req: ExecuteRequest)`
-- **Liquid:** For each `LiquidOrder`, calls `liquid.place_order(symbol, side, size, leverage)` (in `liquid.py` → SDK `place_order`). Appends `{ venue: "liquid", symbol, side, ...result }` or error.
-- **Polymarket:** For each `PolymarketOrder`, calls `polymarket_clob.place_order(token_id, amount_usd, price_limit)` (in `polymarket_clob.py` → FOK market order via py-clob-client). Appends `{ venue: "polymarket", token_id, ...result }` or error.
-- Returns `{ results: [...] }`.
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/agent` | POST | Main chat endpoint — sends prompt, returns grouped markets + liquid perps |
+| `/execute` | POST | Batch trade execution — places orders on both Polymarket and Liquid |
+| `/batch-charts` | POST | Parallel chart data fetch for all visible markets in one request |
+| `/trending-batches` | GET | Top Polymarket categories by volume (Politics, Sports, Crypto, Economy, etc.) |
+| `/batches` | GET | Curated batch suggestions with live Liquid ticker data |
+| `/prices-history` | GET | Proxy to Polymarket CLOB price history |
+| `/candles` | GET | Liquid OHLCV candle data |
 
 ---
 
-### 15. Frontend: Show execution result
+## Frontend Implementation
 
-- **File:** `App.jsx` → `confirmExecute()`
-- Response is stored on the assistant message as `executeResult`. Modal closes.
-- `LiquidBlock` shows a Status column per symbol from `executeResult.results`. User sees success or error per order.
+### Component Architecture (`App.jsx`)
+
+**Landing Page:**
+- Three.js animated dotted wave surface (`DottedSurface.jsx`) — blue-tinted dots that animate upward on load and slide down when the user sends their first message
+- Trending category cards fetched from `/trending-batches` — clickable to pre-fill the search
+- Glassmorphic auto-resizing textarea with backdrop blur
+
+**Results View:**
+- **`EventGroup`** — Collapsible card for a Polymarket event. Shows event title, outcome count, total volume. Blue left border accent when expanded. Contains child `MarketCard` components
+- **`MarketCard`** — Individual prediction market outcome. Question, yes price %, green Yes/red No pill buttons, amount input, sparkline chart
+- **`LiquidCard`** — Perpetual futures card. Symbol, mark price, 24h volume, max leverage. Long/Short buttons, size input, leverage selector
+- **`MiniSparkline`** — Pure canvas sparkline with gradient fill. Area chart for Polymarket (0-100%), line chart for Liquid
+- **`ChartModal`** — Expanded chart view with time range selector (1H/4H/1D/1W). Area charts for Polymarket, candlestick for Liquid
+- **`ShimmerText`** — CSS wave animation for "Searching the markets..." loading state
+
+**Charts:**
+We initially used TradingView's `lightweight-charts` library (tried both v4 and v5) but encountered persistent rendering issues. We switched to pure HTML5 Canvas rendering which works reliably. All chart data is fetched via a single batch request (`POST /batch-charts`) rather than individually per card, significantly improving load times.
+
+### Styling (`index.css`)
+
+Dark trading terminal theme:
+```css
+--bg-primary: #131518;      /* Main background */
+--bg-surface: #1C2026;      /* Card surfaces */
+--bg-elevated: #252A33;     /* Elevated elements */
+--accent-blue: #2E5CFF;     /* Primary accent */
+--color-yes: #27AE60;       /* Yes/Long — green */
+--color-no: #E74C3C;        /* No/Short — red */
+```
+
+Key visual features:
+- Glassmorphic input bar with backdrop blur
+- Event groups with left accent border when expanded, nested background for child markets
+- Smooth expand/collapse transitions
+- Responsive: 2-column grid on desktop, stacked on mobile
+
+### Three.js Background (`DottedSurface.jsx`)
+
+Animated particle field using `THREE.Points` with blue-tinted dots arranged in a grid. The surface undulates with a sine-wave animation. On initial load, the surface animates upward from below the viewport. When the user sends their first message, it slides down and out of view.
 
 ---
 
-## File map
+## Search Quality
 
-| Path | Role |
-|------|------|
-| `backend/main.py` | FastAPI app; `/agent` → `run_agent`, `/execute` → Liquid + Polymarket orders. |
-| `backend/agents.py` | Orchestrates flow: Liquid symbols → Claude parse → Polymarket fetch/filter → Liquid list → optional Claude batch → response. |
-| `backend/polymarket.py` | Gamma API: `fetch_events`, `flatten_markets`, `filter_by_query`. |
-| `backend/liquid.py` | Liquid SDK: `get_liquid_markets`, `get_ticker`, `place_order`. |
-| `backend/polymarket_clob.py` | Polymarket CLOB: `place_order` (FOK market order via private key + API creds). |
-| `frontend/src/App.jsx` | Chat UI, batch grid (MarketsBlock + LiquidBlock), build orders, confirm modal, `/agent` and `/execute` calls. |
-| `frontend/src/index.css` | Styles for chat, batch grid, allocation bar, modal. |
-| `frontend/vite.config.js` | Proxy `/agent` and `/execute` to backend (e.g. port 8001). |
+Search went through several iterations to handle edge cases:
 
----
-
-## APIs and env
-
-- **Polymarket Gamma** (read): no auth; used in `polymarket.py`.
-- **Polymarket CLOB** (trade): `POLY_API_KEY`, `POLY_API_SECRET`, `POLY_API_PASSPHRASE`, `POLY_PRIVATE_KEY` in `backend/.env`; used in `polymarket_clob.py`.
-- **Liquid**: `LIQUID_API_KEY`, `LIQUID_API_SECRET` in `backend/.env`; used in `liquid.py`.
-- **Claude**: `ANTHROPIC_API_KEY` in `backend/.env`; used in `agents.py` for request parsing and optional batch refinement.
-
-`backend/main.py` loads `dotenv` so `.env` is applied.
+| Problem | Root Cause | Fix |
+|---------|-----------|-----|
+| Only 1 result for "Venezuela" when Polymarket has 35+ events | Fetching 500 events out of 9,000 and filtering client-side | Switched to Gamma API `/public-search` for server-side text search |
+| "nfl" matching "inflation" | Simple substring matching | Word-boundary regex (`\bnfl\b` for short terms, `\binflat` prefix for 4+ chars) |
+| Claude generating overly academic search terms like "CPI inflation forecast" | Prompt didn't specify terms must match actual market titles | Updated prompt to require simple words, people names, places, actions |
+| 5 identical gold contracts showing | Same asset from multiple Liquid providers | Ticker alias map + dedup by underlying, keeping highest volume |
+| Netflix (NFLX) showing for "football" | Claude hallucinating symbol relevance | Fuzzy matcher validates Claude's picks; strict rules prevent "nfl" → "nflx" |
 
 ---
 
-## Run
+## Environment Variables
+
+Create a `.env` file in `polymarket-agent-chat/backend/`:
+
+```env
+# Required — AI-powered search term generation
+ANTHROPIC_API_KEY=sk-ant-...
+
+# Required — Liquid perpetual futures data + trading
+LIQUID_API_KEY=...
+LIQUID_API_SECRET=...
+
+# Optional — Polymarket trading (not needed for read-only market data)
+POLY_API_KEY=...
+POLY_API_SECRET=...
+POLY_API_PASSPHRASE=...
+POLY_PRIVATE_KEY=...
+```
+
+**Note:** Polymarket market data (Gamma API) requires no authentication. Polymarket trading (CLOB API) requires all four `POLY_*` variables including a private key for on-chain signing on Polygon.
+
+---
+
+## Running Locally
+
+### Prerequisites
+- Python 3.11+
+- Node.js 18+
+- API keys (see Environment Variables above)
+
+### Backend
 
 ```bash
-# Backend (Python 3.9+)
 cd polymarket-agent-chat/backend
+python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-uvicorn main:app --reload --port 8001
+# Create .env with your API keys (see above)
+uvicorn main:app --reload --port 8000
+```
 
-# Frontend
+### Frontend
+
+```bash
 cd polymarket-agent-chat/frontend
 npm install
 npm run dev
+# Runs on http://localhost:5173
+# Vite proxies API requests to backend on :8000
 ```
 
-Open the frontend URL (e.g. http://localhost:5173). Ensure backend is on 8001 (or match `vite.config.js` proxy).
+Open **http://localhost:5173** and start typing queries.
 
 ---
 
-## Scope (MVP)
+## Deployment
 
-- [x] Fetch Polymarket events (Gamma) and Liquid markets; filter by theme.
-- [x] Claude: parse any question → intent + search_terms + liquid_symbols; optional batch refinement.
-- [x] Frontend: prompt bar, quick themes, batch card (Polymarket + Liquid), allocations, chart links.
-- [x] Execute: one-click Liquid + Polymarket orders via `/execute`.
-- [x] Env-based API keys (no hardcoded secrets).
+### Frontend → Vercel
+
+```bash
+cd polymarket-agent-chat/frontend
+npm run build    # outputs to dist/
+# Deploy dist/ to Vercel, set VITE_API_URL env var to Railway backend URL
+```
+
+### Backend → Railway
+
+The included `Dockerfile` builds a production container:
+
+```dockerfile
+FROM python:3.11-slim
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+COPY . .
+EXPOSE 8080
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8080"]
+```
+
+Set all environment variables in Railway's dashboard.
+
+---
+
+## Project Structure
+
+```
+polymarket-agent-chat/
+├── backend/
+│   ├── main.py              # FastAPI app — all API endpoints
+│   ├── agents.py            # AI agent orchestrator (Claude Haiku)
+│   ├── polymarket.py        # Gamma API client — search, events, filtering
+│   ├── polymarket_clob.py   # CLOB API client — order placement
+│   ├── liquid.py            # Liquid SDK wrapper — markets, tickers, candles, orders
+│   ├── batches.py           # Curated batch definitions
+│   ├── requirements.txt     # Python dependencies
+│   ├── Dockerfile           # Production container
+│   └── .env                 # API keys (not committed)
+├── frontend/
+│   ├── src/
+│   │   ├── App.jsx          # Main app — all UI components
+│   │   ├── DottedSurface.jsx# Three.js animated background
+│   │   ├── index.css        # Global styles, dark theme
+│   │   └── main.jsx         # React entry point
+│   ├── index.html           # HTML shell with Inter font
+│   ├── vite.config.js       # Vite config with API proxy
+│   └── package.json         # Node dependencies
+├── .gitignore
+└── README.md
+```
+
+---
+
+## Example Queries
+
+| Query | What You Get |
+|-------|-------------|
+| "Show me Venezuela markets" | 30+ Polymarket events (invasion, leadership, elections, oil production) + crude oil perps |
+| "Hedge against inflation" | Fed rate cut markets, CPI, recession predictions + gold, silver, bond perps |
+| "Crypto bull run" | Bitcoin/ETH price prediction markets + BTC-PERP, ETH-PERP, SOL-PERP with leverage |
+| "Oil markets" | OPEC, crude oil price, energy policy predictions + WTI, Brent, natural gas perps |
+| "Football" | NFL Draft, Super Bowl, team matchup predictions (no false positives like Netflix) |
+
+---
+
+Built for the **Liquid Trading** ($8K) and **Polymarket Bonus** ($2K) hackathon tracks.
