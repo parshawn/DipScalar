@@ -2,7 +2,7 @@
 import os
 import json
 import logging
-from polymarket import fetch_events, flatten_markets, filter_by_query
+from polymarket import search_events, flatten_markets, filter_by_query
 from liquid import get_liquid_markets, get_ticker
 
 logger = logging.getLogger("agents")
@@ -67,15 +67,20 @@ async def _claude_parse_request(prompt: str, available_liquid_symbols: list[str]
                     "stocks like xyz:NVDA, indices like abcd:USA500): " + ", ".join(symbols_preview) + "\n\n"
                     "Reply with ONLY valid JSON, no markdown or explanation. Keys: "
                     '"intent" (one of: markets, trade, general), '
-                    '"search_terms" (array of 5-15 keywords to find related Polymarket prediction markets. '
-                    'CRITICAL: These terms are matched against prediction market QUESTION TITLES like "Will inflation reach 3%?" or "Will the Fed decrease interest rates?". '
-                    'Always include SIMPLE single words that appear in market titles (e.g. "inflation", "fed", "recession"), '
-                    'PLUS multi-word phrases for specificity (e.g. "rate cut", "interest rate", "crude oil"). '
-                    'Mix of both single words and phrases is essential. '
-                    'Examples: "hedge against inflation" -> ["inflation", "fed", "rate cut", "interest rate", "recession", "gdp", "tariff", "economic"]. '
-                    '"football" -> ["nfl", "football", "nfl draft", "super bowl", "quarterback"]. '
-                    '"oil" -> ["oil", "crude", "opec", "brent", "energy"]. '
-                    'Do NOT use overly specific academic phrases like "CPI inflation forecast" that would never appear in a market title), '
+                    '"search_terms" (array of 10-20 keywords to find related Polymarket prediction markets. '
+                    'CRITICAL: These terms are matched via word-boundary regex against market TITLES and QUESTIONS. '
+                    'Include ALL of these categories: '
+                    '1) The main topic word itself (e.g. "venezuela") '
+                    '2) KEY PEOPLE associated with the topic (e.g. "maduro", "machado" for Venezuela; "trump" if politically relevant) '
+                    '3) Related PLACES and entities (e.g. "caracas", "latin america", "cuba" for Venezuela) '
+                    '4) Related ACTIONS and events (e.g. "invade", "coup", "election", "strike", "sanctions") '
+                    '5) Multi-word phrases that appear in market titles (e.g. "crude oil", "rate cut") '
+                    'The MORE terms you provide, the more markets we find. Be EXHAUSTIVE. '
+                    'Examples: "venezuela" -> ["venezuela", "venezuelan", "maduro", "machado", "caracas", "invade", "coup", "latin america", "cuba", "sanctions", "oil production", "exile"]. '
+                    '"football" -> ["nfl", "football", "nfl draft", "super bowl", "quarterback", "touchdown", "chiefs", "eagles"]. '
+                    '"oil" -> ["oil", "crude", "opec", "brent", "energy", "petroleum", "barrel"]. '
+                    '"inflation" -> ["inflation", "fed", "rate cut", "interest rate", "recession", "gdp", "tariff", "economic", "cpi", "powell"]. '
+                    'Do NOT use overly specific academic phrases that would never appear in a market title), '
                     '"liquid_symbols" (array of 0-15 symbols from the EXACT available list above that DIRECTLY relate to the user request; '
                     'include ALL relevant symbols across different providers like xyz:, flx:, km:, cash:, hyna: prefixes. '
                     'IMPORTANT: only include symbols that are DIRECTLY related to the query. If nothing matches, return an empty array. '
@@ -90,7 +95,7 @@ async def _claude_parse_request(prompt: str, available_liquid_symbols: list[str]
         data = json.loads(raw)
         return {
             "intent": (data.get("intent") or "general").lower()[:20],
-            "search_terms": [str(t).strip() for t in (data.get("search_terms") or []) if str(t).strip()][:20],
+            "search_terms": [str(t).strip() for t in (data.get("search_terms") or []) if str(t).strip()][:25],
             "liquid_symbols": [str(s).strip() for s in (data.get("liquid_symbols") or []) if str(s).strip()][:20],
         }
     except Exception:
@@ -210,17 +215,63 @@ async def run_agent(prompt: str) -> dict:
     )
 
     if wants_data:
-        # Build Polymarket filter: use ALL search terms as OR query
+        # Build search terms
         if search_terms:
             all_terms = [t.lower().strip() for t in search_terms if t.strip()]
         else:
             q = _short_query_from_prompt(prompt)
             all_terms = [q] if q else []
 
-        events = await fetch_events(limit=500)
-        all_markets = flatten_markets(events)
-        # Search with all terms at once (OR logic)
-        markets = filter_by_query(all_markets, all_terms[0] if all_terms else "", extra_terms=all_terms[1:] if len(all_terms) > 1 else None)
+        # Use Gamma /public-search API for server-side text search
+        # Search with multiple terms in parallel and merge results
+        import asyncio
+        search_queries = set()
+        # Use the main topic terms (first few) as separate search queries
+        for term in all_terms[:6]:
+            if len(term) >= 3:
+                search_queries.add(term)
+        # Also search the raw user prompt words
+        for word in prompt_lower.split():
+            if len(word) >= 4 and word not in ("show", "list", "give", "find", "search", "markets", "events", "related", "about"):
+                search_queries.add(word)
+        if not search_queries:
+            search_queries = {prompt_lower.strip()[:50]}
+
+        logger.info(f"Server-side search queries: {search_queries}")
+
+        # Run all searches in parallel
+        async def _search(q):
+            try:
+                return await search_events(q, limit=50)
+            except Exception as e:
+                logger.error(f"search_events({q!r}) failed: {e}")
+                return []
+
+        search_results = await asyncio.gather(*[_search(q) for q in search_queries])
+        # Merge and deduplicate events by slug
+        seen_slugs = set()
+        merged_events = []
+        for events in search_results:
+            for ev in events:
+                slug = ev.get("slug", "")
+                if slug and slug in seen_slugs:
+                    continue
+                seen_slugs.add(slug)
+                merged_events.append(ev)
+
+        all_markets = flatten_markets(merged_events)
+        logger.info(f"Server-side search found {len(merged_events)} unique events, {len(all_markets)} markets")
+
+        # Light client-side filter to remove false positives from broad search
+        if all_terms:
+            filtered = filter_by_query(all_markets, all_terms[0], extra_terms=all_terms[1:] if len(all_terms) > 1 else None)
+            # Only apply if it doesn't eliminate too much (search API is already relevant)
+            if len(filtered) >= len(all_markets) * 0.3 or len(filtered) >= 5:
+                markets = filtered
+            else:
+                markets = all_markets
+        else:
+            markets = all_markets
 
         # Group by event_title to avoid showing 30+ outcomes for the same event
         event_groups = {}
@@ -239,23 +290,7 @@ async def run_agent(prompt: str) -> dict:
                 "top_market": sorted_group[0],  # highest volume market shown by default
                 "markets": sorted_group[:20],    # cap at 20 outcomes per event
             })
-        # Filter out event groups whose title doesn't relate to any search term
-        # This catches false positives like "inflation" showing up in "football" results
-        if all_terms:
-            core_query = prompt_lower.split()
-            core_words = [w for w in core_query if len(w) >= 3 and w not in ("show", "me", "markets", "give", "list", "the", "for", "and")]
-            if core_words:
-                filtered_groups = []
-                for g in grouped_markets:
-                    title_lower = g["event_title"].lower()
-                    # Keep if event title contains any core query word OR any of the first 3 search terms
-                    check_terms = core_words + all_terms[:3]
-                    if any(t in title_lower for t in check_terms):
-                        filtered_groups.append(g)
-                # Only apply filter if it doesn't eliminate everything
-                if filtered_groups:
-                    grouped_markets = filtered_groups
-        grouped_markets = grouped_markets[:20]
+        grouped_markets = grouped_markets[:30]
 
         # Claude may pick symbols, otherwise search dynamically against real available symbols
         # Always validate: fuzzy search first, then use Claude picks only if they overlap or fuzzy found nothing
