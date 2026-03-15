@@ -5,6 +5,8 @@ load_dotenv(Path(__file__).parent / ".env")
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
 from agents import run_agent
@@ -20,6 +22,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Serve frontend static files in production
+STATIC_DIR = Path(__file__).parent / "static"
 
 
 class AgentRequest(BaseModel):
@@ -271,3 +276,14 @@ async def get_batches():
             "liquid_count": len(liquid_markets),
         })
     return {"batches": result}
+
+
+# ── Serve frontend static files (must be after all API routes) ──
+if STATIC_DIR.exists():
+    @app.get("/{full_path:path}")
+    async def serve_spa(full_path: str):
+        """Serve the React SPA for any non-API route."""
+        file = STATIC_DIR / full_path
+        if file.is_file():
+            return FileResponse(file)
+        return FileResponse(STATIC_DIR / "index.html")
